@@ -78,8 +78,8 @@ export function normalizeWatch(raw, index) {
 
   const showtimes = raw.showtimes || {};
   const earliest = parseTime(name, 'showtimes.earliest', showtimes.earliest, 0);
+  // latest earlier than earliest (e.g. 5:00 PM to 3:00 AM) means the window runs past midnight.
   const latest = parseTime(name, 'showtimes.latest', showtimes.latest, 24 * 60 - 1);
-  if (earliest > latest) fail(name, 'showtimes.earliest is later than showtimes.latest.');
 
   return {
     name,

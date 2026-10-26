@@ -7,6 +7,7 @@ import {
   watchDates,
 } from './config.mjs';
 import {
+  actualShowDate,
   allowedRowsFor,
   dateInTimeZone,
   findTicketPlan,
@@ -23,7 +24,8 @@ import { selectDue } from './schedule.mjs';
 import { describePlan, sendSeatAlerts, sendStatus } from './notify.mjs';
 
 function isPast(showtime, today, nowMinutes) {
-  return showtime.date < today || (showtime.date === today && showtime.minutes <= nowMinutes);
+  const date = actualShowDate(showtime.date, showtime.minutes);
+  return date < today || (date === today && showtime.minutes <= nowMinutes);
 }
 
 function titleFromSlug(slug) {
@@ -206,7 +208,9 @@ async function run(config, watches, state, { now, today, nowMinutes }) {
           ? findTicketPlan(seats.filter((seat) => allowedRows.has(seat.row)), watch)
           : null;
         const minutes = info?.minutes ?? session.minutes;
-        const label = `${watch.name}: ${formatDate(session.date)} ${formatClock(minutes)}`;
+        // The seat page gives the real start date; otherwise move after-midnight shows to the next day.
+        const showDate = info?.date ?? actualShowDate(session.date, minutes);
+        const label = `${watch.name}: ${formatDate(showDate)} ${formatClock(minutes)}`;
         if (!plan) {
           delete entry.alerts[watch.name];
           console.log(`${label}: no qualifying seats (rows ${[...allowedRows].join('') || 'none'}).`);
@@ -224,7 +228,7 @@ async function run(config, watches, state, { now, today, nowMinutes }) {
           movieTitle: info?.movieTitle || titleFromSlug(session.movie),
           format: session.format,
           theatreName: info?.theatreName || session.theatreName || session.theatreSlug,
-          date: session.date,
+          date: showDate,
           minutes,
           seatText: describePlan(plan),
         });

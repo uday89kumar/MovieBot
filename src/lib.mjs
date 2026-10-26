@@ -315,8 +315,25 @@ export function findTicketPlan(rawSeats, { tickets = 6, minGroup = 2, middlePerc
   return null;
 }
 
+/**
+ * Both ends are included. A window whose latest time is earlier than its
+ * earliest (e.g. 5:00 PM to 3:00 AM) runs past midnight.
+ */
 export function showtimeInWindow(minutes, earliest = 0, latest = 24 * 60 - 1) {
-  return Number.isFinite(minutes) && minutes >= earliest && minutes <= latest;
+  if (!Number.isFinite(minutes)) return false;
+  if (earliest <= latest) return minutes >= earliest && minutes <= latest;
+  return minutes >= earliest || minutes <= latest;
+}
+
+// Harkins lists after-midnight shows (e.g. 12:30 AM) under the previous
+// evening's date; anything starting before this hour is treated that way.
+export const LATE_NIGHT_END_MINUTES = 4 * 60;
+
+/**
+ * Calendar date a listed showtime actually starts on.
+ */
+export function actualShowDate(listedDate, minutes) {
+  return minutes < LATE_NIGHT_END_MINUTES ? addDays(listedDate, 1) : listedDate;
 }
 
 export function groupsFingerprint(groups) {

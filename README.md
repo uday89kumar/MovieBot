@@ -30,10 +30,10 @@ Edit [`watches.json`](watches.json) on github.com or in your editor, then commit
 | `name` | yes | Any unique label; shown in alerts. |
 | `movie` | yes | The movie's slug: the end of its harkins.com address (`harkins.com/movies/the-odyssey` → `the-odyssey`). |
 | `theatre` | yes | The theatre's slug (`arizona-mills-w-imax`) or numeric ID (`16`). Run `find-ids` to list them. |
-| `format` | no | `"IMAX 70mm"`, `"Ciné XL"`, `"Digital"`, a list like `["IMAX 70mm", "IMAX"]`, or `"any"` (default). Capitals, spaces and accents don't matter. |
+| `format` | no | `"IMAX 70mm"`, `"Ciné XL"`, `"Digital"`, a list like `["IMAX 70mm", "IMAX"]`, or `"any"` (default). Capitals, spaces and accents don't matter, but otherwise the name must match Harkins' label exactly. Some movies use longer labels such as `"Ciné XL + Infinity Vision"`, so check with `find-ids`. |
 | `until` | yes | Last date to watch (`YYYY-MM-DD`). After it, the watch is skipped. |
-| `from` | no | First date to watch; defaults to today. At most 45 days ahead are checked. |
-| `showtimes` | no | `earliest` / `latest` start times, both included. Defaults to the whole day. |
+| `from` | no | First date to watch; defaults to today. Only dates within `maxDaysAhead` of today are checked. |
+| `showtimes` | no | `earliest` / `latest` start times, both included. Defaults to the whole day. A `latest` earlier than `earliest` runs past midnight: `"5:00 PM"` to `"3:00 AM"` includes late-night shows. |
 | `tickets` | no | Total seats needed (default 2). |
 | `minGroup` | no | Smallest block of side-by-side seats allowed (default 2). With 6 tickets and 2, any of 6, 4+2, 3+3 or 2+2+2 counts. Use 1 to allow single seats. |
 | `together` | no | `true` = all tickets side by side in one row. |
@@ -48,6 +48,7 @@ Settings at the top of `watches.json` (the defaults are sensible):
 | Setting | Default | Meaning |
 |---|---:|---|
 | `timeZone` | `America/Phoenix` | Time zone for "today" and showtimes. |
+| `maxDaysAhead` | 45 | How far ahead of today dates are checked. Raise it for movies that go on sale early. |
 | `maxShowtimePagesPerRun` | 10 | Showtime pages read per run. |
 | `maxSeatMapsPerRun` | 8 | Seat maps opened per run. |
 | `blockPauseHours` | 2 | How long to stop after Harkins shows a CAPTCHA/block. |

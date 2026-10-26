@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  actualShowDate,
   addDays,
   allowedRowsFor,
   findAvailableRuns,
@@ -77,6 +78,21 @@ test('showtime window includes both ends', () => {
   assert.equal(showtimeInWindow(23 * 60, 14 * 60, 23 * 60), true);
   assert.equal(showtimeInWindow(13 * 60 + 59, 14 * 60, 23 * 60), false);
   assert.equal(showtimeInWindow(23 * 60 + 1, 14 * 60, 23 * 60), false);
+});
+
+test('showtime window can run past midnight', () => {
+  const earliest = 17 * 60;
+  const latest = 3 * 60;
+  assert.equal(showtimeInWindow(19 * 60, earliest, latest), true);
+  assert.equal(showtimeInWindow(30, earliest, latest), true);
+  assert.equal(showtimeInWindow(3 * 60, earliest, latest), true);
+  assert.equal(showtimeInWindow(14 * 60, earliest, latest), false);
+  assert.equal(showtimeInWindow(4 * 60, earliest, latest), false);
+});
+
+test('after-midnight shows belong to the next calendar day', () => {
+  assert.equal(actualShowDate('2026-12-17', 30), '2026-12-18');
+  assert.equal(actualShowDate('2026-12-17', 19 * 60), '2026-12-17');
 });
 
 test('finds physically adjacent seats', () => {
