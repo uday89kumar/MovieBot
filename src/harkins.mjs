@@ -1,13 +1,30 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { parseClockMinutes } from './lib.mjs';
-import { extractVistaSeats } from './vista.mjs';
+import { formatClock, parseClockMinutes } from './lib.mjs';
+import { extractSeatPlan, extractShowtimeInfo } from './seatplan.mjs';
 import { extractVisualSeats } from './visual.mjs';
 
-const BLOCK_PATTERNS = /captcha|access denied|temporarily blocked|verify you are human|unusual traffic/i;
+const BLOCK_PATTERNS = /captcha|access denied|temporarily blocked|verify you are human|unusual traffic|request unsuccessful/i;
+
+export class BlockedError extends Error {
+  constructor(url) {
+    super(`Harkins showed a block/CAPTCHA page at ${url}; stopping without any bypass attempt.`);
+    this.name = 'BlockedError';
+    this.url = url;
+  }
+}
+
+export function movieDayUrl(movieSlug, date) {
+  return `https://harkins.com/movies/${movieSlug}/${date}`;
+}
+
+export function sessionUrl({ theatreId, movieId, sessionId, date }) {
+  return `https://harkins.com/ticketing/theatre/${theatreId}/movie/${movieId}/session/${sessionId}/date/${date}`;
+}
 
 async function dismissCommonDialogs(page) {
-  const labels = [/accept all/i, /accept cookies/i, /^accept$/i, /agree/i, /continue/i];
+  // Only cookie/consent banners; the most privacy-preserving choice comes first.
+  const labels = [/reject all/i, /decline/i, /necessary only/i, /accept all/i, /accept cookies/i, /^accept$/i];
   for (const label of labels) {
     const button = page.getByRole('button', { name: label }).first();
     if (await button.isVisible().catch(() => false)) {
@@ -17,7 +34,7 @@ async function dismissCommonDialogs(page) {
   }
 }
 
-async function saveDebug(page, name, extra = {}) {
+export async function saveDebug(page, name, extra = {}) {
   await fs.mkdir('debug', { recursive: true });
   const safe = name.replace(/[^a-zA-Z0-9_.-]+/g, '_').slice(0, 150);
   await page.screenshot({ path: path.join('debug', `${safe}.png`), fullPage: true }).catch(() => {});
@@ -26,107 +43,110 @@ async function saveDebug(page, name, extra = {}) {
   await fs.writeFile(path.join('debug', `${safe}.json`), JSON.stringify(extra, null, 2)).catch(() => {});
 }
 
-export async function discoverSessions(context, { date, movieSlug, theatreId, movieId }) {
+async function throwIfBlocked(page, url, debugName) {
+  const bodyText = await page.locator('body').innerText({ timeout: 10_000 }).catch(() => '');
+  if (BLOCK_PATTERNS.test(bodyText)) {
+    await saveDebug(page, `blocked-${debugName}`, { url, bodyText: bodyText.slice(0, 2000) });
+    throw new BlockedError(url);
+  }
+  return bodyText;
+}
+
+/**
+ * Read every showtime on a movie's page for one date, across all theatres.
+ * Each format block is a [data-testid="movie-showtime-category"] whose label
+ * is an <h3> ("Digital") or a logo image's alt text ("Ciné XL"); each theatre
+ * block links to /theatres/<slug>/<date>.
+ *
+ * Returns { ok, showtimes }. ok is false when the page did not render at all,
+ * which counts toward the "bot may be broken" check. Zero showtimes with a
+ * rendered page is normal (e.g. a movie that has not opened yet).
+ */
+export async function discoverShowtimes(context, { movieSlug, date }) {
   const page = await context.newPage();
-  const url = `https://harkins.com/movies/${movieSlug}/${date}?recentTheatre=${theatreId}`;
+  const url = movieDayUrl(movieSlug, date);
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await dismissCommonDialogs(page);
-    await page.waitForTimeout(3_000);
-    const bodyText = await page.locator('body').innerText({ timeout: 10_000 }).catch(() => '');
-    if (BLOCK_PATTERNS.test(bodyText)) {
-      await saveDebug(page, `blocked-discovery-${date}`, { url, bodyText: bodyText.slice(0, 2000) });
-      throw new Error(`Harkins blocked the discovery page for ${date}; no bypass attempted.`);
+    await page.waitForSelector('a[href*="/ticketing/theatre/"], [data-testid="movie-showtime-category"]', { timeout: 15_000 })
+      .catch(() => {});
+    const bodyText = await throwIfBlocked(page, url, `discovery-${movieSlug}-${date}`);
+    if (/page not found|not in the script/i.test(bodyText)) {
+      await saveDebug(page, `not-found-${movieSlug}-${date}`, { url });
+      return { ok: false, reason: `Movie page not found: ${url}`, showtimes: [] };
     }
 
-    const rawLinks = await page.evaluate(({ theatreId: tid, movieId: mid }) => {
-      const expected = `/ticketing/theatre/${tid}/movie/${mid}/session/`;
-      const values = [];
-      for (const anchor of document.querySelectorAll('a[href]')) {
-        const href = anchor.href || '';
-        if (!href.includes(expected)) continue;
-        let node = anchor;
-        let contextText = (anchor.innerText || anchor.textContent || '').replace(/\s+/g, ' ').trim();
-        let fallbackText = contextText;
-        for (let depth = 0; depth < 6 && node; depth += 1, node = node.parentElement) {
-          const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-          if (text.length > fallbackText.length && text.length < 450) fallbackText = text;
-          if (/imax/i.test(text) && text.length < 450) {
-            contextText = text;
-            break;
+    const raw = await page.evaluate(() => {
+      const results = [];
+      for (const anchor of document.querySelectorAll('a[href*="/ticketing/theatre/"]')) {
+        const href = anchor.getAttribute('href') || '';
+        const match = href.match(/\/ticketing\/theatre\/(\d+)\/movie\/([A-Za-z0-9]+)\/session\/(\d+)\/date\/(\d{4}-\d{2}-\d{2})/);
+        if (!match) continue;
+        const category = anchor.closest('[data-testid="movie-showtime-category"]');
+        const heading = category?.querySelector('h1,h2,h3,h4')?.innerText?.trim();
+        const logo = category?.querySelector('img[alt]')?.getAttribute('alt')?.trim();
+        let theatreSlug = null;
+        let theatreName = null;
+        for (let node = category || anchor; node && !theatreSlug; node = node.parentElement) {
+          const links = [...(node.querySelectorAll?.('a[href^="/theatres/"], a[href*="harkins.com/theatres/"]') || [])];
+          if (links.length) {
+            theatreSlug = (links[0].getAttribute('href').match(/\/theatres\/([^/?#]+)/) || [])[1] || null;
+            theatreName = links.map((link) => (link.innerText || '').trim()).find(Boolean) || null;
           }
         }
-        if (!/imax/i.test(contextText)) contextText = fallbackText;
-        values.push({ href, anchorText: (anchor.innerText || '').trim(), contextText });
+        results.push({
+          theatreId: match[1],
+          movieId: match[2],
+          sessionId: match[3],
+          date: match[4],
+          timeText: (anchor.innerText || '').trim(),
+          format: heading || logo || '',
+          theatreSlug,
+          theatreName,
+          past: /\bdisabled\b/.test(anchor.className || '') || anchor.getAttribute('aria-disabled') === 'true',
+        });
       }
-      const htmlMatches = [...document.documentElement.innerHTML.matchAll(
-        new RegExp(`/ticketing/theatre/${tid}/movie/${mid}/session/\\d+/date/\\d{4}-\\d{2}-\\d{2}`, 'g'),
-      )].map((match) => ({ href: new URL(match[0], location.origin).href, anchorText: '', contextText: '' }));
-      return [...values, ...htmlMatches];
-    }, { theatreId, movieId });
+      return results;
+    });
 
     const unique = new Map();
-    for (const link of rawLinks) {
-      const normalized = link.href.replace('http://', 'https://');
-      const contextText = `${link.anchorText} ${link.contextText}`.replace(/\s+/g, ' ').trim();
-      const anchorMinutes = parseClockMinutes(link.anchorText);
-      const hintMinutes = anchorMinutes ?? parseClockMinutes(contextText);
-      const hasImaxHint = /imax/i.test(contextText);
-      const looks70mm = /70\s*mm/i.test(contextText);
-      const existing = unique.get(normalized);
-      if (!existing || contextText.length > existing.contextText.length) {
-        unique.set(normalized, { url: normalized, contextText, hintMinutes, anchorMinutes, hasImaxHint, looks70mm });
-      }
+    for (const item of raw) {
+      const minutes = parseClockMinutes(item.timeText);
+      if (minutes === null || !item.format) continue;
+      unique.set(item.sessionId, { ...item, minutes, url: sessionUrl(item) });
     }
-
-    const allSessions = [...unique.values()];
-    const imaxSessions = allSessions.filter((item) => item.hasImaxHint);
-    const sessions = imaxSessions.length ? imaxSessions : allSessions;
-    console.log(`${date}: found ${sessions.length} possible IMAX session link(s).`);
-    return sessions;
+    const showtimes = [...unique.values()];
+    console.log(`${movieSlug} ${date}: ${showtimes.length} showtime(s) across all theatres.`);
+    return { ok: bodyText.trim().length > 0, showtimes };
   } finally {
     await page.close();
   }
 }
 
-function sessionMetadataFromText(url, title, headingText) {
-  const date = url.match(/\/date\/(\d{4}-\d{2}-\d{2})/)?.[1] || null;
-  const titleMinutes = parseClockMinutes(title);
-  const headingMinutes = parseClockMinutes(headingText);
-  return {
-    date,
-    minutes: titleMinutes ?? headingMinutes,
-    title,
-    isImax70mm: /IMAX\s*70\s*mm/i.test(`${title} ${headingText}`),
-  };
-}
-
-export async function inspectSession(context, session, { allowedRows, excludeAccessible = true }) {
+/**
+ * Open one seat page and read availability. Never clicks a seat.
+ * Seat-plan JSON is the primary source; rendered icons are the fallback.
+ * Throws BlockedError on a CAPTCHA/block page.
+ */
+export async function inspectSession(context, session, { excludeAccessible = true } = {}) {
   const page = await context.newPage();
-  const debugName = `session-${session.url.match(/session\/(\d+)/)?.[1] || Date.now()}`;
+  const debugName = `session-${session.sessionId || session.url.match(/session\/(\d+)/)?.[1] || Date.now()}`;
   const captures = [];
   const pendingCaptures = [];
 
-  // Any Playwright route disables the browser HTTP cache. That ensures every
-  // session exposes its own live Vista availability response for inspection.
+  // Any Playwright route disables the browser HTTP cache, so each visit sees live data.
   await page.route('**/*', (route) => route.continue());
 
   page.on('response', (response) => {
-    const requestType = response.request().resourceType();
-    if (!['xhr', 'fetch', 'document'].includes(requestType)) return;
     const url = response.url();
-    const headers = response.headers();
-    const contentLength = Number(headers['content-length'] || 0);
-    if (contentLength > 5_000_000) return;
+    if (!/ticketingservice\.harkins\.com\/api\/Theatre\/(GetSeatPlan|GetTheatreShowtime)/i.test(url)) return;
     const capture = response.body()
       .then((body) => {
         if (body.length > 5_000_000) return;
-        const text = body.toString('utf8').trim();
-        if (!text || !['{', '['].includes(text[0])) return;
         try {
-          captures.push({ url, status: response.status(), json: JSON.parse(text) });
+          captures.push({ url, status: response.status(), json: JSON.parse(body.toString('utf8')) });
         } catch {
-          // Not a JSON payload. The rendered-seat fallback below remains available.
+          // Not JSON; the rendered-icon fallback remains available.
         }
       })
       .catch(() => {});
@@ -136,67 +156,57 @@ export async function inspectSession(context, session, { allowedRows, excludeAcc
   try {
     await page.goto(session.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     await dismissCommonDialogs(page);
-    await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(() => {});
-    await page.waitForTimeout(2_000);
+    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+    await page.waitForTimeout(1_500);
     await Promise.allSettled(pendingCaptures);
+    const bodyText = await throwIfBlocked(page, session.url, debugName);
 
-    const bodyText = await page.locator('body').innerText({ timeout: 12_000 }).catch(() => '');
-    const title = await page.title();
-    const headingText = (await page.locator('h1,h2,h3').allInnerTexts().catch(() => [])).join(' | ');
-    const metadata = sessionMetadataFromText(page.url(), title, `${headingText} ${bodyText.slice(0, 4000)}`);
+    const info = extractShowtimeInfo(captures);
+    let extraction = extractSeatPlan(captures, { excludeAccessible });
+    let method = 'seat-plan-json';
 
-    if (BLOCK_PATTERNS.test(bodyText)) {
-      await saveDebug(page, `blocked-${debugName}`, { url: session.url, title, bodyText: bodyText.slice(0, 3000) });
-      return { ...metadata, url: session.url, blocked: true, seats: [], confidence: 'none' };
-    }
-    if (!metadata.isImax70mm) {
-      return { ...metadata, url: session.url, skippedFormat: true, seats: [], confidence: 'none' };
-    }
-
-    const vista = extractVistaSeats(captures, { allowedRows, excludeAccessible });
-    let extraction = vista;
-    let method = 'vista-live-payload';
-
-    if (vista.confidence !== 'high') {
-      const visual = await extractVisualSeats(page, { allowedRows, excludeAccessible });
+    if (extraction.confidence !== 'high') {
+      const visual = await extractVisualSeats(page, { excludeAccessible });
       if (visual.confidence === 'high') {
-        extraction = visual;
+        extraction = { ...visual, rowOrder: null };
         method = 'rendered-seat-icons';
       } else {
         extraction = {
           seats: [],
-          confidence: visual.confidence === 'low' || vista.confidence === 'low' ? 'low' : 'none',
-          diagnostics: { vista: vista.diagnostics, visual: visual.diagnostics },
+          rowOrder: null,
+          confidence: visual.confidence === 'low' || extraction.confidence === 'low' ? 'low' : 'none',
+          diagnostics: { seatPlan: extraction.diagnostics, visual: visual.diagnostics },
         };
       }
     }
 
     const availableCount = extraction.seats.filter((seat) => seat.status === 'available').length;
     if (extraction.confidence !== 'high') {
-      await saveDebug(page, `${debugName}-seat-data-unverified`, {
+      await saveDebug(page, `${debugName}-unverified`, {
         url: session.url,
-        metadata,
-        availableCount,
+        info,
         diagnostics: extraction.diagnostics,
-        bodyText: bodyText.slice(0, 5000),
+        bodyText: bodyText.slice(0, 3000),
       });
     }
 
-    console.log(`${metadata.date} ${title}: ${method}; ${availableCount} verified available seat(s).`);
+    const when = info?.date && info.minutes !== null ? `${info.date} ${formatClock(info.minutes)}` : session.url;
+    console.log(`${when} ${session.format || ''}: ${method}, ${extraction.confidence} confidence, `
+      + `${availableCount} open seat(s).`);
     return {
-      ...metadata,
       url: session.url,
+      info,
       seats: extraction.seats,
+      rowOrder: extraction.rowOrder,
       confidence: extraction.confidence,
-      blocked: false,
-      diagnostics: { method, ...extraction.diagnostics },
+      method,
+      diagnostics: extraction.diagnostics,
     };
   } catch (error) {
+    if (error instanceof BlockedError) throw error;
     await saveDebug(page, `${debugName}-error`, { url: session.url, error: error.stack || String(error) });
     return { url: session.url, error: error.message, seats: [], confidence: 'none' };
   } finally {
     await page.close();
   }
 }
-
-export { saveDebug };

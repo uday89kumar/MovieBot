@@ -1,92 +1,118 @@
 import { chromium } from 'playwright';
 import {
-  addDays,
+  activeWatches,
+  attributesMatch,
+  loadConfig,
+  showtimeWanted,
+  watchDates,
+} from './config.mjs';
+import {
+  allowedRowsFor,
   dateInTimeZone,
   findTicketPlan,
   formatClock,
+  formatDate,
   groupsFingerprint,
+  jitter,
   minutesInTimeZone,
-  parseRows,
-  showtimeIsAllowed,
+  sleep,
 } from './lib.mjs';
-import { discoverSessions, inspectSession } from './harkins.mjs';
-import { loadState, saveState } from './github-state.mjs';
-import { sendGitHubAlert } from './github-alert.mjs';
+import { BlockedError, discoverShowtimes, inspectSession } from './harkins.mjs';
+import { loadState, pruneState, saveState } from './github-state.mjs';
+import { selectDue } from './schedule.mjs';
+import { describePlan, sendSeatAlerts, sendStatus } from './notify.mjs';
 
-const config = {
-  theatreId: process.env.THEATRE_ID || '16',
-  movieId: process.env.MOVIE_ID || 'HO00014201',
-  movieSlug: process.env.MOVIE_SLUG || 'the-odyssey',
-  timeZone: process.env.TIME_ZONE || 'America/Phoenix',
-  allowedRows: parseRows(process.env.ROWS || 'G,H,I,J,K,L,M'),
-  totalTickets: Number(process.env.TOTAL_TICKETS || 6),
-  minBlockSize: Number(process.env.MIN_BLOCK_SIZE || 2),
-  middlePercent: Number(process.env.MIDDLE_PERCENT || 50),
-  minShowMinutes: Number(process.env.AFTER_MINUTES || 14 * 60),
-  maxShowMinutes: Number(process.env.LAST_SHOW_MINUTES || 23 * 60),
-  startOffsetDays: Number(process.env.START_OFFSET_DAYS || 0),
-  scanDays: Number(process.env.SCAN_DAYS || 7),
-  concurrency: Math.max(1, Number(process.env.SESSION_CONCURRENCY || 3)),
-  excludeAccessible: process.env.EXCLUDE_ACCESSIBLE !== 'false',
-};
-
-function shouldCheckSession(result, today, nowMinutes) {
-  if (!result.date || result.minutes === null || result.minutes === undefined) return false;
-  if (!showtimeIsAllowed(result.minutes, config.minShowMinutes, config.maxShowMinutes)) return false;
-  if (result.date < today) return false;
-  if (result.date === today && result.minutes <= nowMinutes) return false;
-  return true;
+function isPast(showtime, today, nowMinutes) {
+  return showtime.date < today || (showtime.date === today && showtime.minutes <= nowMinutes);
 }
 
-function formatPlan(plan) {
-  return plan.blocks
-    .map((block) => `${block.seats[0]}–${block.seats.at(-1)} (${block.seats.length})`)
-    .join(' + ');
+function titleFromSlug(slug) {
+  return slug.split('-').map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 
-async function asyncPool(limit, items, worker) {
-  const results = [];
-  let nextIndex = 0;
-  async function run() {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      results[index] = await worker(items[index], index);
+function compactShowtime(showtime) {
+  const { url, sessionId, theatreId, theatreSlug, theatreName, movieId, format, date, minutes } = showtime;
+  return { url, sessionId, theatreId, theatreSlug, theatreName, movieId, format, date, minutes };
+}
+
+async function handleBlock(state, config, now, error) {
+  console.warn(error.message);
+  const pausedUntil = new Date(now.getTime() + config.blockPauseHours * 3_600_000);
+  state.block.pausedUntil = pausedUntil.toISOString();
+  if (!state.block.active) {
+    const sent = await sendStatus(
+      'MovieBot blocked: check manually',
+      `Harkins showed a CAPTCHA or block page, so MovieBot paused all checks until `
+        + `${pausedUntil.toISOString().slice(11, 16)} UTC. It will not try to get around it. `
+        + `Check the seat maps yourself in the meantime: ${error.url}`,
+    );
+    // Remember the alert only once it went out, so a failed send is retried.
+    state.block.active = sent;
+  }
+}
+
+async function updateHealth(state, config, watches, health) {
+  for (const watch of watches) {
+    const result = health.get(watch.name);
+    if (!result.pagesTried && !result.seatsTried) continue;
+    const pagesBad = result.pagesTried && !result.pagesOk;
+    const seatsBad = result.seatsTried && !result.seatsOk;
+    const entry = (state.health[watch.name] ||= { badRuns: 0, alerted: false });
+    if (!pagesBad && !seatsBad) {
+      entry.badRuns = 0;
+      entry.alerted = false;
+      continue;
+    }
+    entry.badRuns += 1;
+    if (entry.badRuns >= config.brokenAfterRuns && !entry.alerted) {
+      entry.alerted = await sendStatus(
+        'MovieBot may be broken',
+        `Watch "${watch.name}" has had ${entry.badRuns} runs in a row where Harkins pages could not be read. `
+          + 'Check the latest workflow run and its debug files on GitHub. '
+          + 'A wrong movie or theatre slug in watches.json also causes this.',
+      );
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
-  return results;
-}
-
-function alertBody(alerts) {
-  const lines = [
-    '## Verified Odyssey IMAX 70mm seat availability',
-    '',
-    'Every seat below was verified from Harkins’ live seat map. The monitor accepts authoritative live seat data when exposed; otherwise it reads the rendered red-seat and unavailable-seat icons without selecting or holding seats.',
-    '',
-  ];
-  for (const alert of alerts) {
-    lines.push(
-      `### ${alert.date} at ${alert.clock}`,
-      '',
-      `- **Six-seat arrangement:** ${alert.groupText}`,
-      `- **Allowed pattern:** ${alert.patternText}`,
-      `- **Seat position:** Entire group is within the middle ${config.middlePercent}% of its row`,
-      `- [Open the Harkins seat map](${alert.url})`,
-      '',
-    );
+  for (const name of Object.keys(state.health)) {
+    if (!watches.some((watch) => watch.name === name)) delete state.health[name];
   }
-  lines.push('> Availability can change immediately.');
-  return lines.join('\n');
 }
 
-async function main() {
-  console.log('Monitor configuration:', { ...config, allowedRows: [...config.allowedRows] });
-  const today = dateInTimeZone(config.timeZone);
-  const nowMinutes = minutesInTimeZone(config.timeZone);
-  const { issueNumber, state } = await loadState();
-  state.sessions ||= {};
+async function run(config, watches, state, { now, today, nowMinutes }) {
+  if (!watches.length) {
+    console.log('No active watches (all disabled or past their "until" date). Nothing to do.');
+    return;
+  }
+  if (state.block.pausedUntil && Date.parse(state.block.pausedUntil) > now.getTime()) {
+    console.log(`Paused after a Harkins block until ${state.block.pausedUntil}. Skipping this run.`);
+    return;
+  }
 
+  // Per watch: did any showtime page / seat map load properly this run?
+  const health = new Map(watches.map((watch) =>
+    [watch.name, { pagesTried: false, pagesOk: false, seatsTried: false, seatsOk: false }]));
+  const markHealth = (affected, kind, ok) => {
+    for (const watch of affected) {
+      const entry = health.get(watch.name);
+      entry[`${kind}Tried`] = true;
+      if (ok) entry[`${kind}Ok`] = true;
+    }
+  };
+
+  // 1. Showtime pages that are due (one page per movie and date covers every theatre).
+  const pageItems = new Map();
+  for (const watch of watches) {
+    for (const date of watchDates(watch, today, config.maxDaysAhead)) {
+      const key = `${watch.movie}|${date}`;
+      if (!pageItems.has(key)) pageItems.set(key, { key, movie: watch.movie, date, checkedAt: state.pages[key]?.checkedAt });
+    }
+  }
+  const pagesToCheck = selectDue([...pageItems.values()], { today, now, limit: config.maxShowtimePagesPerRun });
+  console.log(`${pagesToCheck.length} of ${pageItems.size} showtime page(s) due this run.`);
+
+  const alerts = [];
+  let blockedError = null;
+  let loadedAnyPage = false;
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1200 },
@@ -96,103 +122,154 @@ async function main() {
   });
 
   try {
-    const discovered = [];
-    for (let offset = config.startOffsetDays; offset < config.startOffsetDays + config.scanDays; offset += 1) {
-      const date = addDays(today, offset);
+    for (const [index, item] of pagesToCheck.entries()) {
+      if (index) await sleep(jitter(2_000, 6_000));
+      const affected = watches.filter((watch) => watch.movie === item.movie);
+      let result;
       try {
-        discovered.push(...await discoverSessions(context, { date, ...config }));
+        result = await discoverShowtimes(context, { movieSlug: item.movie, date: item.date });
       } catch (error) {
-        console.error(`Discovery failed for ${date}:`, error.message);
-      }
-    }
-
-    const uniqueSessions = [...new Map(discovered.map((session) => [session.url, session])).values()]
-      .filter((session) => {
-        const date = session.url.match(/\/date\/(\d{4}-\d{2}-\d{2})/)?.[1];
-        if (session.anchorMinutes !== null && session.anchorMinutes !== undefined) {
-          if (!showtimeIsAllowed(session.anchorMinutes, config.minShowMinutes, config.maxShowMinutes)) return false;
-          if (date === today && session.anchorMinutes <= nowMinutes) return false;
+        if (error instanceof BlockedError) {
+          blockedError = error;
+          break;
         }
-        return !date || date >= today;
-      });
-    console.log(`Inspecting ${uniqueSessions.length} unique possible session(s) after pre-filtering.`);
-
-    const results = await asyncPool(config.concurrency, uniqueSessions, (session) =>
-      inspectSession(context, session, config));
-
-    const scannedAt = new Date().toISOString();
-    const pendingAlerts = [];
-
-    for (const result of results) {
-      if (result.blocked) {
-        console.warn(`Blocked session; skipped without bypassing: ${result.url}`);
+        console.error(`Showtimes page failed for ${item.key}: ${error.message}`);
+        markHealth(affected, 'pages', false);
         continue;
       }
-      if (result.skippedFormat || !result.isImax70mm) continue;
-      if (!shouldCheckSession(result, today, nowMinutes)) continue;
-      if (result.confidence !== 'high') {
-        console.warn(`Seat availability could not be verified; no alert: ${result.url}`);
+      loadedAnyPage = true;
+      markHealth(affected, 'pages', result.ok);
+      if (!result.ok) {
+        console.warn(result.reason || `Showtimes page for ${item.key} did not render.`);
         continue;
       }
-
-      const plan = findTicketPlan(
-        result.seats,
-        config.totalTickets,
-        config.minBlockSize,
-        config.middlePercent,
-      );
-      const groups = plan?.blocks || [];
-      const fingerprint = groupsFingerprint(groups);
-      const prior = state.sessions[result.url];
-
-      if (!groups.length) {
-        if (prior) delete state.sessions[result.url];
-        console.log(`${result.date} ${formatClock(result.minutes)}: no verified qualifying groups.`);
-        continue;
-      }
-
-      if (prior?.fingerprint === fingerprint) {
-        console.log(`${result.date} ${formatClock(result.minutes)}: verified qualifying seats unchanged; suppressing duplicate alert.`);
-        continue;
-      }
-
-      pendingAlerts.push({
-        url: result.url,
-        date: result.date,
-        clock: formatClock(result.minutes),
-        minutes: result.minutes,
-        groupText: formatPlan(plan),
-        patternText: plan.pattern.join('+'),
-        fingerprint,
-      });
+      const wanted = result.showtimes.filter((showtime) =>
+        !showtime.past && affected.some((watch) => showtimeWanted(watch, showtime, today)));
+      state.pages[item.key] = { checkedAt: now.toISOString(), showtimes: wanted.map(compactShowtime) };
     }
 
-    pendingAlerts.sort((a, b) => a.date.localeCompare(b.date) || a.minutes - b.minutes);
-    if (pendingAlerts.length) {
-      const title = pendingAlerts.length === 1
-        ? `🎟️ Odyssey IMAX 70mm seats: ${pendingAlerts[0].date} at ${pendingAlerts[0].clock}`
-        : `🎟️ Odyssey IMAX 70mm seats: ${pendingAlerts.length} verified showtimes`;
-      const sent = await sendGitHubAlert({ title, body: alertBody(pendingAlerts) });
-      if (sent) {
-        for (const alert of pendingAlerts) {
-          state.sessions[alert.url] = { fingerprint: alert.fingerprint, lastSeen: scannedAt };
+    // 2. Seat maps that are due, from every cached showtime some watch still wants.
+    const candidates = [];
+    if (!blockedError) {
+      for (const [key, page] of Object.entries(state.pages)) {
+        const movie = key.split('|')[0];
+        for (const showtime of page.showtimes || []) {
+          if (isPast(showtime, today, nowMinutes)) continue;
+          const matching = watches.filter((watch) => watch.movie === movie && showtimeWanted(watch, showtime, today));
+          if (!matching.length) continue;
+          candidates.push({ ...showtime, movie, watches: matching, checkedAt: state.sessions[showtime.url]?.checkedAt });
         }
-        console.log(`Created one GitHub alert covering ${pendingAlerts.length} verified showtime(s).`);
-      } else {
-        console.warn('Alert delivery failed; verified matches will be retried next run.');
       }
-    } else {
-      console.log('No new verified qualifying availability to alert.');
     }
+    const sessionsToCheck = selectDue(candidates, { today, now, limit: config.maxSeatMapsPerRun });
+    console.log(`${sessionsToCheck.length} of ${candidates.length} seat map(s) due this run.`);
 
-    const cutoff = Date.now() - 60 * 24 * 60 * 60 * 1000;
-    for (const [url, entry] of Object.entries(state.sessions)) {
-      if (entry.lastSeen && Date.parse(entry.lastSeen) < cutoff) delete state.sessions[url];
+    for (const [index, session] of sessionsToCheck.entries()) {
+      if (index || pagesToCheck.length) await sleep(jitter(3_000, 8_000));
+      let result;
+      try {
+        result = await inspectSession(context, session, {
+          excludeAccessible: session.watches.every((watch) => watch.excludeAccessible),
+        });
+      } catch (error) {
+        if (error instanceof BlockedError) {
+          blockedError = error;
+          break;
+        }
+        throw error;
+      }
+      loadedAnyPage = true;
+      const verified = result.confidence === 'high';
+      markHealth(session.watches, 'seats', verified);
+      const entry = (state.sessions[session.url] ||= { alerts: {} });
+      entry.checkedAt = now.toISOString();
+      entry.date = session.date;
+      entry.alerts ||= {};
+      if (!verified) {
+        console.warn(`Seats could not be verified, no alert: ${session.url}`);
+        continue;
+      }
+      const info = result.info;
+      const salesOpen = !info || info.allowTicketSales;
+
+      for (const watch of session.watches) {
+        if (info && !attributesMatch(watch, info.attributes)) {
+          console.warn(`Format double-check failed for "${watch.name}" at ${session.url}: ${info.attributes.join(', ')}`);
+          continue;
+        }
+        // Accessible seats were read as open if any watch allows them; re-apply this watch's own choice.
+        const seats = result.seats.map((seat) => (watch.excludeAccessible && seat.accessible
+          ? { ...seat, status: 'unavailable' }
+          : seat));
+        const allowedRows = allowedRowsFor(seats, watch, result.rowOrder);
+        const plan = salesOpen
+          ? findTicketPlan(seats.filter((seat) => allowedRows.has(seat.row)), watch)
+          : null;
+        const minutes = info?.minutes ?? session.minutes;
+        const label = `${watch.name}: ${formatDate(session.date)} ${formatClock(minutes)}`;
+        if (!plan) {
+          delete entry.alerts[watch.name];
+          console.log(`${label}: no qualifying seats (rows ${[...allowedRows].join('') || 'none'}).`);
+          continue;
+        }
+        const fingerprint = groupsFingerprint(plan.blocks);
+        if (entry.alerts[watch.name] === fingerprint) {
+          console.log(`${label}: same qualifying seats as last alert, not repeating.`);
+          continue;
+        }
+        alerts.push({
+          watchName: watch.name,
+          url: session.url,
+          fingerprint,
+          movieTitle: info?.movieTitle || titleFromSlug(session.movie),
+          format: session.format,
+          theatreName: info?.theatreName || session.theatreName || session.theatreSlug,
+          date: session.date,
+          minutes,
+          seatText: describePlan(plan),
+        });
+      }
     }
-    await saveState(issueNumber, state);
   } finally {
     await context.close();
     await browser.close();
+  }
+
+  // 3. Deliver alerts found before any block, then record them.
+  if (alerts.length) {
+    const delivered = await sendSeatAlerts(alerts);
+    if (delivered) {
+      for (const alert of alerts) state.sessions[alert.url].alerts[alert.watchName] = alert.fingerprint;
+      console.log(`Sent ${alerts.length} seat alert(s).`);
+    } else {
+      console.warn('No alert channel delivered; the same seats will be alerted next run.');
+    }
+  } else {
+    console.log('No new qualifying seats.');
+  }
+
+  if (blockedError) {
+    await handleBlock(state, config, now, blockedError);
+    return;
+  }
+  if (loadedAnyPage) state.block.active = false;
+  await updateHealth(state, config, watches, health);
+}
+
+async function main() {
+  const config = await loadConfig();
+  const now = new Date();
+  const today = dateInTimeZone(config.timeZone, now);
+  const nowMinutes = minutesInTimeZone(config.timeZone, now);
+  const watches = activeWatches(config, today);
+  console.log(`MovieBot: ${watches.length} active watch(es) on ${today}.`);
+
+  const { issueNumber, state } = await loadState();
+  try {
+    await run(config, watches, state, { now, today, nowMinutes });
+  } finally {
+    pruneState(state, today);
+    await saveState(issueNumber, state);
   }
 }
 

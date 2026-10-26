@@ -1,98 +1,97 @@
-# Harkins Odyssey IMAX 70mm Seat Monitor — six-ticket rule
+# MovieBot: Harkins seat alerts
 
-This cloud Playwright monitor checks **The Odyssey (IMAX 70mm)** at Harkins Arizona Mills 18 while your Mac is off. It reads Harkins’ verified live availability data when exposed; otherwise it verifies the actual rendered seat icons. It fails closed when availability is ambiguous and never selects, holds, reserves, or purchases seats.
+MovieBot watches Harkins seat maps for the movies, theatres and formats you list, and messages you on **Telegram** when a showtime has the seats you want. You then open the link and book them yourself.
 
-## Current alert rule
+It **never selects, holds, reserves or buys seats**, and it never tries to get around a CAPTCHA or block page. It runs free on GitHub Actions every 15 minutes, so your computer can stay off.
 
-An alert is created only when one showtime satisfies **all** of these conditions:
+First-time setup (Telegram bot, secrets, making the repo public): see **[SETUP.md](SETUP.md)**.
 
-- showtime is strictly **after 2:00 PM** and no later than **11:00 PM**;
-- exactly **6 tickets** can be chosen using one of these arrangements:
-  - **6 together**;
-  - **4 together + 2 together**;
-  - **3 together + 3 together**;
-  - **2 together + 2 together + 2 together**;
-- every block contains at least **2 physically adjacent, consecutively numbered seats**;
-- every selected seat is in rows **G through M**;
-- every selected block is entirely inside the row’s **middle 50%**;
-- wheelchair and accessible-companion seats are excluded.
+## Adding a watch
 
-A longer available run may be used. For example, a run of 7 seats can supply the required 6, and a run of 5 plus a pair can supply 4+2. Isolated single seats never count.
+Edit [`watches.json`](watches.json) on github.com or in your editor, then commit. Each entry in `watches` is one thing to look for:
 
-## Alerts
-
-The workflow creates a private GitHub issue only when the rule is met. It assigns and mentions `@KIRAN-REDDY`, allowing GitHub to email the verified address selected in the account’s notification settings.
-
-No Gmail password, SMTP credential, Telegram token, or custom repository secret is required.
-
-## Schedule
-
-- Today through day 6: every 10 minutes.
-- Days 7 through 44: once per hour.
-- Manual runs default to 7 days.
-
-## Update the existing repository
-
-Replace the repository files with this package, commit, and push. The state format is version 4, so alerts saved under earlier rule engines will not suppress a valid six-ticket alert.
-
-## Validation
-
-The unit tests cover:
-
-- 6;
-- 4+2;
-- 3+3;
-- 2+2+2;
-- longer runs used as subsets;
-- rejection of fewer than six usable seats;
-- rejection of isolated single seats;
-- middle-50% filtering;
-- the after-2:00-PM through 11:00-PM time window;
-- unavailable and ambiguous rendered-seat icons.
-
-Run locally with:
-
-```bash
-npm test
+```json
+{
+  "name": "Odyssey IMAX 70mm, 6 seats",
+  "movie": "the-odyssey",
+  "theatre": "arizona-mills-w-imax",
+  "format": "IMAX 70mm",
+  "until": "2026-09-11",
+  "showtimes": { "earliest": "2:00 PM", "latest": "11:00 PM" },
+  "tickets": 6,
+  "minGroup": 2,
+  "depth": [0.35, 0.75],
+  "middlePercent": 50
+}
 ```
 
-Run a one-day GitHub test without sending a setup notification:
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | Any unique label; shown in alerts. |
+| `movie` | yes | The movie's slug: the end of its harkins.com address (`harkins.com/movies/the-odyssey` → `the-odyssey`). |
+| `theatre` | yes | The theatre's slug (`arizona-mills-w-imax`) or numeric ID (`16`). Run `find-ids` to list them. |
+| `format` | no | `"IMAX 70mm"`, `"Ciné XL"`, `"Digital"`, a list like `["IMAX 70mm", "IMAX"]`, or `"any"` (default). Capitals, spaces and accents don't matter. |
+| `until` | yes | Last date to watch (`YYYY-MM-DD`). After it, the watch is skipped. |
+| `from` | no | First date to watch; defaults to today. At most 45 days ahead are checked. |
+| `showtimes` | no | `earliest` / `latest` start times, both included. Defaults to the whole day. |
+| `tickets` | no | Total seats needed (default 2). |
+| `minGroup` | no | Smallest block of side-by-side seats allowed (default 2). With 6 tickets and 2, any of 6, 4+2, 3+3 or 2+2+2 counts. Use 1 to allow single seats. |
+| `together` | no | `true` = all tickets side by side in one row. |
+| `rows` | no | Exact rows, e.g. `"G-M"` or `"E,G-J"`. Overrides `depth`. |
+| `depth` | no | Part of the room from front (0) to back (1). Default `[0.35, 0.75]`, about the middle of the room. Works in any auditorium, whatever its row letters. |
+| `middlePercent` | no | Seats must sit in this central share of their row (default 50; 100 = anywhere). |
+| `excludeAccessible` | no | Skip wheelchair and companion seats (default `true`). |
+| `enabled` | no | `false` pauses a watch without deleting it. |
 
-```bash
-gh workflow run monitor.yml \
-  -R KIRAN-REDDY/harkins-odyssey-monitor \
-  -f start_offset_days=0 \
-  -f scan_days=1 \
-  -f send_test_notification=false
-```
+Settings at the top of `watches.json` (the defaults are sensible):
 
-## Configuration
-
-| Variable | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---:|---|
-| `ROWS` | `G,H,I,J,K,L,M` | Allowed rows |
-| `TOTAL_TICKETS` | `6` | Total tickets required in one showtime |
-| `MIN_BLOCK_SIZE` | `2` | Minimum adjacent seats in every block |
-| `MIDDLE_PERCENT` | `50` | Allowed central portion of each row |
-| `AFTER_MINUTES` | `840` | Showtime must be strictly later than 2:00 PM |
-| `LAST_SHOW_MINUTES` | `1380` | Latest accepted showtime is 11:00 PM |
-| `EXCLUDE_ACCESSIBLE` | `true` | Exclude wheelchair and companion seats |
-| `SESSION_CONCURRENCY` | `3` | Parallel session pages |
-| `ALERT_GITHUB_USER` | `KIRAN-REDDY` | Account assigned and mentioned |
+| `timeZone` | `America/Phoenix` | Time zone for "today" and showtimes. |
+| `maxShowtimePagesPerRun` | 10 | Showtime pages read per run. |
+| `maxSeatMapsPerRun` | 8 | Seat maps opened per run. |
+| `blockPauseHours` | 2 | How long to stop after Harkins shows a CAPTCHA/block. |
+| `brokenAfterRuns` | 3 | Bad runs in a row before a "may be broken" message. |
 
-## Diagnostics
+### Finding slugs and format names
 
-When verification fails, the workflow uploads screenshots, HTML, and JSON metadata under the run’s **Artifacts** section. Missing data, CAPTCHAs, blocks, unknown icons, or markup changes produce no ticket alert.
+Needs [Node.js](https://nodejs.org) 20 or newer on your computer:
 
-## Temporary release schedule (Phoenix time)
+```bash
+npm install
+npx playwright install chromium
+npm run find-ids -- the-odyssey
+npm run find-ids -- the-odyssey arizona-mills-w-imax
+```
 
-- Wednesday, July 29, 2026: every 10 minutes, scanning August 21 through September 11.
-- Thursday, July 30 through Friday, September 11, 2026: every 4 hours, scanning a rolling 45-day window.
-- At 12:05 AM Phoenix time on September 12, a lightweight retirement job disables `monitor.yml` automatically. The monitoring job also refuses to run after September 11, 2026. No manual shutdown is required.
+It prints a table of theatre slugs, theatre IDs and the exact format names for that movie. Copy them into `watches.json`.
 
+## How a run works
 
-## Automatic retirement
+1. **Showtimes.** Harkins lists every theatre's showtimes for a movie and date on one page (`/movies/<slug>/<date>`). MovieBot reads the pages that are due and keeps the showtimes that match a watch's theatre, format, dates and times.
+2. **Seat maps.** It opens at most `maxSeatMapsPerRun` seat maps per run. Showtimes it has never checked come first, then the most overdue. A showtime is due about every 15 minutes when it's within 3 days, hourly for 4–14 days out, and every 4 hours beyond that. Showtime pages follow the same schedule.
+3. **Reading seats.** The main source is the seat data the seat page itself loads, cross-checked against Harkins' own open-seat count. If that doesn't add up, MovieBot reads the seat icons from a screenshot, calibrated against the page's own colour key. If neither is clear, it sends **no alert** and saves screenshots for debugging.
+4. **Matching.** Seats must be open, in the allowed rows, side by side with consecutive numbers (no aisle in between), and inside the middle of the row.
+5. **Alerting.** New matches go to Telegram (with sound) and to a GitHub issue. The same seats aren't alerted twice; if they disappear and come back, you're alerted again.
 
-The workflow has a hard expiration date of **September 11, 2026**. At **12:05 AM Phoenix time on September 12**, a final lightweight job calls GitHub's workflow-disable API using the repository's temporary `GITHUB_TOKEN`. It does not install Node, Playwright, or Chrome during that retirement run.
+### When something goes wrong
 
-The gate job also checks the Phoenix calendar date before every invocation. Any manual or delayed invocation after September 11 skips all seat-monitoring work and disables the workflow instead. The workflow requests `actions: write` solely for this self-disable operation.
+- **CAPTCHA or block page:** MovieBot stops all checks for `blockPauseHours` and sends one silent "blocked, check manually" message. It doesn't try to solve or avoid the CAPTCHA.
+- **Pages it can't read:** after `brokenAfterRuns` bad runs in a row for a watch, you get one silent "may be broken" message. Screenshots, HTML and details are in the workflow run's **Artifacts** for 5 days. A wrong movie or theatre slug looks the same.
+- **Bookkeeping** is stored as JSON in an issue titled "MovieBot state — do not delete". Deleting it only means already-sent alerts may repeat once.
+
+## Being polite to Harkins
+
+`harkins.com/robots.txt` asks bots not to load `/ticketing` pages, which is where the seat maps are. MovieBot keeps those visits low: a fixed cap per run, random gaps between page loads, and a full stop when blocked. Keep the caps modest, and disable watches you no longer need.
+
+## Running locally
+
+```bash
+npm install
+npx playwright install chromium
+npm test
+npm run inspect -- "https://harkins.com/ticketing/theatre/16/movie/HO00016344/session/576959/date/2026-10-25"
+npm run monitor
+```
+
+`inspect` opens one seat map in a visible browser and prints what MovieBot reads, using the first watch's rules (add a watch name as a second argument to pick another). `monitor` without `GITHUB_TOKEN` keeps its state in memory and only prints alerts unless Telegram variables are set.

@@ -1,25 +1,31 @@
+// Usage: npm run inspect -- <Harkins seat-map URL> [watch name]
+// Opens one seat map in a visible browser and prints what MovieBot reads,
+// using the named watch's seat rules (or the first watch in watches.json).
 import { chromium } from 'playwright';
-import { findTicketPlan, parseRows } from './lib.mjs';
+import { loadConfig } from './config.mjs';
+import { allowedRowsFor, findTicketPlan } from './lib.mjs';
 import { inspectSession } from './harkins.mjs';
 
-const url = process.argv[2];
+const [url, watchName] = process.argv.slice(2);
 if (!url) {
-  console.error('Usage: npm run inspect -- <Harkins session URL>');
+  console.error('Usage: npm run inspect -- <Harkins seat-map URL> [watch name]');
   process.exit(1);
 }
 
-const config = {
-  allowedRows: parseRows(process.env.ROWS || 'G,H,I,J,K,L,M'),
-  excludeAccessible: process.env.EXCLUDE_ACCESSIBLE !== 'false',
-  middlePercent: Number(process.env.MIDDLE_PERCENT || 50),
-  totalTickets: Number(process.env.TOTAL_TICKETS || 6),
-  minBlockSize: Number(process.env.MIN_BLOCK_SIZE || 2),
-};
+const config = await loadConfig();
+const watch = config.watches.find((item) => item.name === watchName) || config.watches[0];
 const browser = await chromium.launch({ headless: false });
 const context = await browser.newContext({ viewport: { width: 1440, height: 1200 } });
-const result = await inspectSession(context, { url, anchorMinutes: null }, config);
-const plan = result.confidence === 'high'
-  ? findTicketPlan(result.seats, config.totalTickets, config.minBlockSize, config.middlePercent)
-  : null;
-console.log(JSON.stringify({ ...result, seats: undefined, plan }, null, 2));
-await browser.close();
+try {
+  const result = await inspectSession(context, { url }, { excludeAccessible: watch?.excludeAccessible !== false });
+  let plan = null;
+  let rows = [];
+  if (result.confidence === 'high' && watch) {
+    const allowed = allowedRowsFor(result.seats, watch, result.rowOrder);
+    rows = [...allowed];
+    plan = findTicketPlan(result.seats.filter((seat) => allowed.has(seat.row)), watch);
+  }
+  console.log(JSON.stringify({ ...result, seats: undefined, watch: watch?.name, allowedRows: rows, plan }, null, 2));
+} finally {
+  await browser.close();
+}

@@ -1,12 +1,3 @@
-export function parseRows(value = 'G,H,I,J,K,L,M') {
-  return new Set(
-    value
-      .split(',')
-      .map((row) => row.trim().toUpperCase())
-      .filter(Boolean),
-  );
-}
-
 export function parseClockMinutes(text) {
   if (!text) return null;
   const match = String(text).match(/\b(1[0-2]|0?[1-9]):([0-5]\d)\s*([AP])\.?M\.?\b/i);
@@ -22,6 +13,16 @@ export function formatClock(minutes) {
   const suffix = hour24 >= 12 ? 'PM' : 'AM';
   const hour12 = hour24 % 12 || 12;
   return `${hour12}:${String(minute).padStart(2, '0')} ${suffix}`;
+}
+
+export function formatDate(yyyyMmDd) {
+  const [year, month, day] = yyyyMmDd.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).toLocaleDateString('en-US', {
+    timeZone: 'UTC',
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  });
 }
 
 export function dateInTimeZone(timeZone, now = new Date()) {
@@ -51,6 +52,82 @@ export function addDays(yyyyMmDd, days) {
   const date = new Date(Date.UTC(year, month - 1, day));
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+}
+
+export function daysBetween(fromYyyyMmDd, toYyyyMmDd) {
+  const toUtc = (value) => {
+    const [year, month, day] = value.split('-').map(Number);
+    return Date.UTC(year, month - 1, day);
+  };
+  return Math.round((toUtc(toYyyyMmDd) - toUtc(fromYyyyMmDd)) / 86_400_000);
+}
+
+/**
+ * Normalize a format label so "CINÉ XL", "Cine XL" and "CINÉXL" compare equal.
+ */
+export function formatKey(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Expand a row spec such as "G-M" or "A,C,F-H" into a set of row names.
+ * Ranges work on single letters; multi-letter rows (AA) can be listed explicitly.
+ */
+export function parseRowSpec(value) {
+  const rows = new Set();
+  for (const part of String(value || '').split(',')) {
+    const token = part.trim().toUpperCase();
+    if (!token) continue;
+    const range = token.match(/^([A-Z])\s*-\s*([A-Z])$/);
+    if (range) {
+      const start = range[1].charCodeAt(0);
+      const end = range[2].charCodeAt(0);
+      if (end < start) throw new Error(`Row range "${token}" runs backwards.`);
+      for (let code = start; code <= end; code += 1) rows.add(String.fromCharCode(code));
+    } else if (/^[A-Z]{1,3}$/.test(token)) {
+      rows.add(token);
+    } else {
+      throw new Error(`Cannot understand row "${token}". Use letters such as "G-M" or "A,C,F-H".`);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Rows ordered front (nearest the screen) to back. Uses the order supplied by
+ * the seat data when present, otherwise the rendered vertical position.
+ */
+export function rowOrderFromSeats(seats, explicitOrder = null) {
+  const present = new Set(seats.map((seat) => seat.row));
+  if (explicitOrder?.length) return explicitOrder.filter((row) => present.has(row));
+  const byRow = new Map();
+  for (const seat of seats) {
+    if (!byRow.has(seat.row)) byRow.set(seat.row, []);
+    byRow.get(seat.row).push(seat.y);
+  }
+  return [...byRow.entries()]
+    .map(([row, ys]) => ({ row, y: median(ys) }))
+    .sort((a, b) => a.y - b.y)
+    .map((item) => item.row);
+}
+
+/**
+ * Choose which rows a watch accepts: explicit row letters win; otherwise a
+ * depth band, where 0 is the front row and 1 the back row.
+ */
+export function allowedRowsFor(seats, { rows = null, depth = [0.35, 0.75] }, explicitOrder = null) {
+  if (rows?.size) return new Set([...rows]);
+  const order = rowOrderFromSeats(seats, explicitOrder);
+  const allowed = new Set();
+  order.forEach((row, index) => {
+    const center = (index + 0.5) / order.length;
+    if (center >= depth[0] && center <= depth[1]) allowed.add(row);
+  });
+  return allowed;
 }
 
 export function median(numbers) {
@@ -84,85 +161,9 @@ export function dedupeSeats(seats) {
 }
 
 /**
- * Find physically adjacent, consecutively numbered available seats.
- * Physical spacing is checked so consecutive numbers across a large aisle do not count.
- */
-export function findAdjacentGroups(rawSeats, minAdjacent = 3, middlePercent = 50) {
-  const seats = dedupeSeats(rawSeats);
-  const rows = new Map();
-  for (const seat of seats) {
-    if (!rows.has(seat.row)) rows.set(seat.row, []);
-    rows.get(seat.row).push(seat);
-  }
-
-  const groups = [];
-  for (const [row, rowSeats] of rows.entries()) {
-    const positioned = rowSeats
-      .filter((seat) => Number.isFinite(seat.x) && Number.isFinite(seat.y) && seat.width > 0 && seat.height > 0)
-      .sort((a, b) => a.x - b.x);
-    if (positioned.length < minAdjacent) continue;
-
-    const allGaps = [];
-    for (let index = 1; index < positioned.length; index += 1) {
-      const gap = positioned[index].x - positioned[index - 1].x;
-      if (gap > 1) allGaps.push(gap);
-    }
-    const typicalGap = median(allGaps);
-    if (!typicalGap) continue;
-    const maxAdjacentGap = typicalGap * 1.72;
-
-    // Keep only seats whose horizontal centers fall inside the requested central
-    // portion of the complete row. For 50%, this removes the outer 25% on each side.
-    const boundedMiddlePercent = Math.min(100, Math.max(1, Number(middlePercent) || 50));
-    const outerFraction = (1 - boundedMiddlePercent / 100) / 2;
-    const firstCenter = positioned[0].x;
-    const lastCenter = positioned.at(-1).x;
-    const rowSpan = lastCenter - firstCenter;
-    const middleStart = firstCenter + rowSpan * outerFraction;
-    const middleEnd = lastCenter - rowSpan * outerFraction;
-
-    const available = positioned.filter((seat) => {
-      if (seat.status !== 'available') return false;
-      return seat.x >= middleStart && seat.x <= middleEnd;
-    });
-    let run = [];
-    const flush = () => {
-      if (run.length >= minAdjacent) {
-        groups.push({
-          row,
-          seats: run.map((seat) => `${seat.row}${seat.number}`),
-          first: run[0].number,
-          last: run.at(-1).number,
-        });
-      }
-      run = [];
-    };
-
-    for (const seat of available) {
-      if (!run.length) {
-        run = [seat];
-        continue;
-      }
-      const previous = run.at(-1);
-      const numberIsConsecutive = Math.abs(seat.number - previous.number) === 1;
-      const physicallyAdjacent = seat.x - previous.x <= maxAdjacentGap;
-      const sameVerticalBand = Math.abs(seat.y - previous.y) <= Math.max(seat.height, previous.height) * 0.8;
-      if (numberIsConsecutive && physicallyAdjacent && sameVerticalBand) run.push(seat);
-      else {
-        flush();
-        run = [seat];
-      }
-    }
-    flush();
-  }
-
-  return groups.sort((a, b) => a.row.localeCompare(b.row) || a.first - b.first);
-}
-
-
-/**
  * Return maximal runs of physically adjacent, consecutively numbered available
  * seats whose centers are inside the requested middle portion of each row.
+ * Physical spacing is checked so consecutive numbers across a large aisle do not count.
  */
 export function findAvailableRuns(rawSeats, minBlockSize = 2, middlePercent = 50) {
   const seats = dedupeSeats(rawSeats);
@@ -182,12 +183,14 @@ export function findAvailableRuns(rawSeats, minBlockSize = 2, middlePercent = 50
     const allGaps = [];
     for (let index = 1; index < positioned.length; index += 1) {
       const gap = positioned[index].x - positioned[index - 1].x;
-      if (gap > 1) allGaps.push(gap);
+      if (gap > 0) allGaps.push(gap);
     }
     const typicalGap = median(allGaps);
     if (!typicalGap) continue;
     const maxAdjacentGap = typicalGap * 1.72;
 
+    // Keep only seats whose horizontal centers fall inside the requested central
+    // portion of the complete row. For 50%, this removes the outer 25% on each side.
     const boundedMiddlePercent = Math.min(100, Math.max(1, Number(middlePercent) || 50));
     const outerFraction = (1 - boundedMiddlePercent / 100) / 2;
     const firstCenter = positioned[0].x;
@@ -276,7 +279,7 @@ function assignPatternToRuns(runs, pattern, index = 0, used = new Set(), selecte
   return null;
 }
 
-function ticketPatterns(totalTickets, minBlockSize, maxPart = totalTickets) {
+export function ticketPatterns(totalTickets, minBlockSize, maxPart = totalTickets) {
   if (totalTickets === 0) return [[]];
   const patterns = [];
   for (let size = Math.min(totalTickets, maxPart); size >= minBlockSize; size -= 1) {
@@ -292,17 +295,18 @@ function ticketPatterns(totalTickets, minBlockSize, maxPart = totalTickets) {
 /**
  * Find the requested number of tickets using adjacent blocks no smaller than
  * minBlockSize. For six tickets with a minimum block of two, the accepted
- * patterns are: 6, 4+2, 3+3, or 2+2+2.
+ * patterns are: 6, 4+2, 3+3, or 2+2+2. With together, only one block is accepted.
  */
-export function findTicketPlan(rawSeats, totalTickets = 6, minBlockSize = 2, middlePercent = 50) {
-  const runs = findAvailableRuns(rawSeats, minBlockSize, middlePercent);
-  const patterns = ticketPatterns(totalTickets, minBlockSize);
+export function findTicketPlan(rawSeats, { tickets = 6, minGroup = 2, middlePercent = 50, together = false } = {}) {
+  const smallestBlock = together ? tickets : Math.min(minGroup, tickets);
+  const runs = findAvailableRuns(rawSeats, smallestBlock, middlePercent);
+  const patterns = together ? [[tickets]] : ticketPatterns(tickets, smallestBlock);
 
   for (const pattern of patterns) {
     const blocks = assignPatternToRuns(runs, pattern);
     if (blocks) {
       return {
-        totalTickets,
+        totalTickets: tickets,
         pattern,
         blocks: blocks.sort((a, b) => a.row.localeCompare(b.row) || a.first - b.first),
       };
@@ -311,12 +315,8 @@ export function findTicketPlan(rawSeats, totalTickets = 6, minBlockSize = 2, mid
   return null;
 }
 
-export function findSixTicketPlan(rawSeats, middlePercent = 50) {
-  return findTicketPlan(rawSeats, 6, 2, middlePercent);
-}
-
-export function showtimeIsAllowed(minutes, afterMinutes = 14 * 60, cutoffMinutes = 23 * 60) {
-  return Number.isFinite(minutes) && minutes > afterMinutes && minutes <= cutoffMinutes;
+export function showtimeInWindow(minutes, earliest = 0, latest = 24 * 60 - 1) {
+  return Number.isFinite(minutes) && minutes >= earliest && minutes <= latest;
 }
 
 export function groupsFingerprint(groups) {
@@ -329,4 +329,12 @@ export function escapeHtml(value) {
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function jitter(minMs, maxMs, random = Math.random) {
+  return Math.round(minMs + random() * (maxMs - minMs));
 }

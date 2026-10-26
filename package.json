@@ -1,11 +1,12 @@
 {
-  "name": "harkins-odyssey-seat-monitor",
-  "version": "4.0.0",
+  "name": "moviebot",
+  "version": "5.0.0",
   "private": true,
   "type": "module",
-  "description": "Fail-closed cloud Playwright monitor that verifies six-ticket Harkins availability from live API data or rendered seat icons.",
+  "description": "Watches Harkins seat maps for any movie, theatre and format, and alerts on Telegram when good seats open up. Never books or holds seats.",
   "scripts": {
     "monitor": "node src/monitor.mjs",
+    "find-ids": "node src/find-ids.mjs",
     "inspect": "node src/inspect.mjs",
     "test": "node --test src/*.test.mjs",
     "test-alert": "node src/test-alert.mjs"

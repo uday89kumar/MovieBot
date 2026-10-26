@@ -1,112 +1,35 @@
-name: Harkins Odyssey Seat Monitor
+name: MovieBot seat monitor
 
 on:
   schedule:
-    # Release day: every 10 minutes on Wednesday, July 29, 2026 (Phoenix time).
-    - cron: '*/10 * 29 7 *'
-      timezone: 'America/Phoenix'
-
-    # Easy mode from Thursday, July 30 through Friday, September 11, 2026:
-    # every 4 hours at minute 17 (Phoenix time).
-    - cron: '17 */4 30-31 7 *'
-      timezone: 'America/Phoenix'
-    - cron: '17 */4 * 8 *'
-      timezone: 'America/Phoenix'
-    - cron: '17 */4 1-11 9 *'
-      timezone: 'America/Phoenix'
-
-    # One final lightweight run disables this workflow after the monitoring window.
-    - cron: '5 0 12 9 *'
-      timezone: 'America/Phoenix'
-
+    # Every 15 minutes. Each run decides what is actually due (see src/schedule.mjs),
+    # and finishes in seconds when nothing is active or checks are paused.
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
-      start_offset_days:
-        description: 'Start this many days from today'
-        required: false
-        default: '0'
-      scan_days:
-        description: 'Number of dates to scan'
-        required: false
-        default: '7'
       send_test_notification:
-        description: 'Create a setup test notification'
+        description: 'Only send a test message to Telegram and a test GitHub issue'
         required: false
         type: boolean
         default: false
 
 permissions:
-  actions: write
   contents: read
   issues: write
 
 concurrency:
-  group: harkins-odyssey-seat-monitor
+  group: moviebot-seat-monitor
   cancel-in-progress: false
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      should_monitor: ${{ steps.window.outputs.should_monitor }}
-      should_disable: ${{ steps.window.outputs.should_disable }}
-    steps:
-      - name: Enforce September 11 expiration
-        id: window
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_SCHEDULE: ${{ github.event.schedule }}
-        run: |
-          today=$(TZ=America/Phoenix date +%F)
-          retirement_schedule='5 0 12 9 *'
-
-          if [[ "$EVENT_SCHEDULE" == "$retirement_schedule" || "$today" > '2026-09-11' ]]; then
-            echo "Monitoring window expired on September 11, 2026."
-            echo "should_monitor=false" >> "$GITHUB_OUTPUT"
-            echo "should_disable=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Monitoring window is active."
-            echo "should_monitor=true" >> "$GITHUB_OUTPUT"
-            echo "should_disable=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  retire:
-    needs: gate
-    if: ${{ needs.gate.outputs.should_disable == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Disable this workflow permanently
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          echo "Disabling ${GITHUB_WORKFLOW} after the September 11, 2026 cutoff."
-          gh api \
-            --method PUT \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/monitor.yml/disable"
-          echo "Workflow disabled successfully."
-
   monitor:
-    needs: gate
-    if: ${{ needs.gate.outputs.should_monitor == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
-      THEATRE_ID: '16'
-      MOVIE_ID: 'HO00014201'
-      MOVIE_SLUG: 'the-odyssey'
-      TIME_ZONE: 'America/Phoenix'
-      ROWS: 'G,H,I,J,K,L,M'
-      TOTAL_TICKETS: '6'
-      MIN_BLOCK_SIZE: '2'
-      MIDDLE_PERCENT: '50'
-      AFTER_MINUTES: '840'
-      LAST_SHOW_MINUTES: '1380'
-      EXCLUDE_ACCESSIBLE: 'true'
-      SESSION_CONCURRENCY: '3'
-      ALERT_GITHUB_USER: 'KIRAN-REDDY'
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ALERT_GITHUB_USER: ${{ github.repository_owner }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - uses: actions/checkout@v4
@@ -115,43 +38,48 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Send test notification
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_notification }}
+        run: node src/test-alert.mjs
+
+      - name: Check whether there is work to do
+        id: precheck
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test_notification) }}
+        run: node src/precheck.mjs
+
       - name: Install dependencies
+        if: ${{ steps.precheck.outputs.run == 'true' }}
         run: npm install --no-audit --no-fund
 
-      - name: Install Chrome for Testing
-        run: npx playwright install --with-deps chromium
-
-      - name: Set scan range
-        shell: bash
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "START_OFFSET_DAYS=${{ inputs.start_offset_days }}" >> "$GITHUB_ENV"
-            echo "SCAN_DAYS=${{ inputs.scan_days }}" >> "$GITHUB_ENV"
-          elif [[ "${{ github.event.schedule }}" == "*/10 * 29 7 *" ]]; then
-            # On release day, focus only on August 21 through September 11.
-            echo "START_OFFSET_DAYS=23" >> "$GITHUB_ENV"
-            echo "SCAN_DAYS=22" >> "$GITHUB_ENV"
-          else
-            # From Thursday onward, check the full rolling 45-day window.
-            echo "START_OFFSET_DAYS=0" >> "$GITHUB_ENV"
-            echo "SCAN_DAYS=45" >> "$GITHUB_ENV"
-          fi
-
       - name: Run unit tests
+        if: ${{ steps.precheck.outputs.run == 'true' }}
         run: npm test
 
-      - name: Send setup test notification
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_notification }}
-        run: npm run test-alert
+      - name: Cache Chrome for Testing
+        if: ${{ steps.precheck.outputs.run == 'true' }}
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package.json') }}
+
+      - name: Install Chrome for Testing
+        if: ${{ steps.precheck.outputs.run == 'true' && steps.browser-cache.outputs.cache-hit != 'true' }}
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Chrome system libraries
+        if: ${{ steps.precheck.outputs.run == 'true' && steps.browser-cache.outputs.cache-hit == 'true' }}
+        run: npx playwright install-deps chromium
 
       - name: Check Harkins seats
+        if: ${{ steps.precheck.outputs.run == 'true' }}
         run: npm run monitor
 
       - name: Upload diagnostics
-        if: always()
+        if: ${{ always() && steps.precheck.outputs.run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: harkins-debug-${{ github.run_id }}
+          name: moviebot-debug-${{ github.run_id }}
           path: debug/
           if-no-files-found: ignore
           retention-days: 5

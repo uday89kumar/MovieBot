@@ -4,7 +4,7 @@ function githubHeaders(token) {
     Authorization: `Bearer ${token}`,
     'X-GitHub-Api-Version': '2022-11-28',
     'Content-Type': 'application/json',
-    'User-Agent': 'harkins-odyssey-seat-monitor',
+    'User-Agent': 'moviebot-seat-monitor',
   };
 }
 
@@ -35,10 +35,7 @@ export async function sendGitHubAlert({ title, body }) {
   const username = process.env.ALERT_GITHUB_USER;
 
   if (!token || !repository || !username) {
-    console.warn(
-      'GitHub alert settings are missing. Required: GITHUB_TOKEN, GITHUB_REPOSITORY, ALERT_GITHUB_USER. Alert follows:\n',
-      body,
-    );
+    console.warn('GitHub issue alerts need GITHUB_TOKEN, GITHUB_REPOSITORY and ALERT_GITHUB_USER. Alert follows:\n', body);
     return false;
   }
 
@@ -47,19 +44,15 @@ export async function sendGitHubAlert({ title, body }) {
     '',
     body,
     '',
-    '_Created automatically by the Harkins Odyssey seat monitor. The monitor never holds or purchases seats._',
+    '_Created automatically by MovieBot. It never holds or purchases seats._',
   ].join('\n');
 
   let issue;
   try {
-    issue = await createIssue({
-      title,
-      body: issueBody,
-      assignees: [username],
-    });
+    issue = await createIssue({ title, body: issueBody, assignees: [username] });
   } catch (error) {
-    // Assignment can fail if the configured username is not assignable. The
-    // @mention still provides the notification path, so retry without it.
+    // Assignment can fail if the username is not assignable. The @mention
+    // still notifies, so retry without it.
     if (error.status !== 422) throw error;
     console.warn(`Could not assign @${username}; retrying with an @mention only.`);
     issue = await createIssue({ title, body: issueBody });

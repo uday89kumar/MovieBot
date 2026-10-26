@@ -1,14 +1,23 @@
 import { sendGitHubAlert } from './github-alert.mjs';
+import { sendTelegram, telegramConfigured } from './telegram.mjs';
 
-const sent = await sendGitHubAlert({
-  title: '✅ Harkins seat monitor test notification',
-  body: [
-    '## Test successful',
-    '',
-    'GitHub issue notifications are configured for this repository.',
-    '',
-    'A real ticket alert is created only when one Odyssey IMAX 70mm showtime after 2:00 PM and no later than 11:00 PM has six middle-row tickets arranged as 6, 4+2, 3+3, or 2+2+2. Every block must contain at least two adjacent seats in the middle 50% of rows G–M.',
-  ].join('\n'),
-});
+const text = 'MovieBot is set up. Real alerts arrive here when a watch in watches.json finds seats.';
 
-if (!sent) process.exitCode = 1;
+let ok = true;
+if (telegramConfigured()) {
+  const sent = await sendTelegram(`✅ <b>MovieBot test</b>\n\n${text}`);
+  console.log(sent ? 'Telegram test message sent.' : 'Telegram test message FAILED (check the bot token and chat ID).');
+  ok &&= sent;
+} else {
+  console.warn('Telegram secrets are not set: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.');
+  ok = false;
+}
+
+const issueSent = await sendGitHubAlert({ title: '✅ MovieBot test notification', body: `## Test successful\n\n${text}` })
+  .catch((error) => {
+    console.error(error.message);
+    return false;
+  });
+ok &&= issueSent;
+
+if (!ok) process.exitCode = 1;
