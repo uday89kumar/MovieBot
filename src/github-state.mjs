@@ -1,6 +1,10 @@
 const STATE_TITLE = 'MovieBot state — do not delete';
 const MARKER = '<!-- MOVIEBOT_STATE -->';
 const STATE_VERSION = 5;
+// Issues created with the workflow's GITHUB_TOKEN are authored by this account.
+const STATE_AUTHOR = 'github-actions[bot]';
+// Only users with write access can label issues; GitHub creates the label on first use.
+const STATE_LABEL = 'moviebot-state';
 // GitHub rejects issue bodies over 65,536 characters; leave room for the wrapper text.
 const MAX_STATE_CHARS = 60_000;
 
@@ -98,14 +102,17 @@ export async function loadState() {
     console.warn('No GITHUB_TOKEN/GITHUB_REPOSITORY: state is in-memory only for this run.');
     return { issueNumber: null, state: emptyState() };
   }
-  const issues = await githubRequest('/issues?state=all&per_page=100');
-  const issue = issues.find((item) => item.title === STATE_TITLE && !item.pull_request);
+  // Look the issue up by label so it is found however many alert issues exist.
+  // The repo is public and anyone may open issues, so also require that the
+  // workflow itself created it, not a look-alike opened by someone else.
+  const issues = await githubRequest(`/issues?state=all&per_page=100&labels=${STATE_LABEL}`);
+  const issue = issues.find((item) => item.title === STATE_TITLE && !item.pull_request && item.user?.login === STATE_AUTHOR);
   if (issue) return { issueNumber: issue.number, state: parseState(issue.body) };
 
   const state = emptyState();
   const created = await githubRequest('/issues', {
     method: 'POST',
-    body: JSON.stringify({ title: STATE_TITLE, body: serializeState(state) }),
+    body: JSON.stringify({ title: STATE_TITLE, body: serializeState(state), labels: [STATE_LABEL] }),
   });
   return { issueNumber: created.number, state };
 }
