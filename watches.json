@@ -8,6 +8,7 @@
   "watches": [
     {
       "name": "Avengers: Doomsday Ciné XL, Arizona Mills, 4 together",
+      "enabled": false,
       "movie": "avengers-doomsday",
       "theatre": "arizona-mills-w-imax",
       "format": ["Ciné XL + Infinity Vision", "Ciné XL"],
@@ -22,6 +23,7 @@
     },
     {
       "name": "Avengers: Doomsday Ciné XL, Tempe Marketplace, 4 together",
+      "enabled": false,
       "movie": "avengers-doomsday",
       "theatre": "tempe-marketplace",
       "format": ["Ciné XL + Infinity Vision", "Ciné XL"],
@@ -36,6 +38,7 @@
     },
     {
       "name": "Avengers: Doomsday Ciné XL, Chandler Fashion, 4 together",
+      "enabled": false,
       "movie": "avengers-doomsday",
       "theatre": "chandler-fashion",
       "format": ["Ciné XL + Infinity Vision", "Ciné XL"],
@@ -50,6 +53,7 @@
     },
     {
       "name": "Avengers: Doomsday Ciné XL, SanTan Village, 4 together",
+      "enabled": false,
       "movie": "avengers-doomsday",
       "theatre": "santan-village",
       "format": ["Ciné XL + Infinity Vision", "Ciné XL"],
